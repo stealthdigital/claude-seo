@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `google_report.py`: the Data Sources & Methodology table listed all five
+  Google APIs on every report, including full-audit envelopes with no Google
+  data. It now lists only sources whose data is present; an envelope without
+  Google data describes the crawl, specialist analyses, and lab Lighthouse,
+  and names the Google sources it did not use. Envelopes can supply their own
+  `data_sources` rows and a `methodology` note (documented in
+  `skills/seo-audit/SKILL.md`). The "Powered by Google APIs" logo follows the
+  same rule.
+- `google_report.py`: the PDF review no longer reports `WARN` when pypdf is
+  absent. Page count now comes from the WeasyPrint render; pypdf is an
+  optional fallback and a missing checker goes under `checks_skipped`.
+
+### Added
+
+- `google_report.py --type full`: a category-score bar chart from
+  `categories[].score` (Figure 1 of the Audit Categories section, saved to
+  `charts/category_scores.png` at 200 DPI). Skipped when matplotlib is missing.
+
 ## [2.4.2] - 2026-10-04
 
 seo-cockpit, Google sign-in through your own account, and a schema-hook fix.

@@ -57,7 +57,7 @@ Delay between requests: 1 second
 - `{domain}-audit/audit-data.json`: Structured audit envelope for report generation
 - `{domain}-audit/findings/*.md`: Per-category specialist findings (`technical.md`, `content.md`, `schema.md`, `performance.md`, `visual.md`, etc.)
 - `{domain}-audit/screenshots/`: Desktop + mobile captures (if Playwright available)
-- **PDF Report** (recommended): Generate a professional A4 PDF using `"${CLAUDE_PLUGIN_ROOT}/scripts/claude-seo" run google_report.py --type full --data {domain}-audit/audit-data.json --domain <domain> --output-dir {domain}-audit/`. This produces a white-cover enterprise report with TOC, executive summary, charts (Lighthouse gauges, query bars, index donut), metric cards, threshold tables, prioritized recommendations with effort estimates, and implementation roadmap. Always offer PDF generation after completing an audit.
+- **PDF Report** (recommended): Generate a professional A4 PDF using `"${CLAUDE_PLUGIN_ROOT}/scripts/claude-seo" run google_report.py --type full --data {domain}-audit/audit-data.json --domain <domain> --output-dir {domain}-audit/`. This produces a white-cover enterprise report with TOC, executive summary, a category-score chart (plus Lighthouse gauges, query bars, and an index donut when Google API data is present), metric cards, threshold tables, prioritized recommendations with effort estimates, and implementation roadmap. Always offer PDF generation after completing an audit.
 
 ## Structured Audit Data Envelope
 
@@ -97,9 +97,15 @@ Write `{domain}-audit/audit-data.json` with this shape so `"${CLAUDE_PLUGIN_ROOT
   "artifacts": {
     "findings_dir": "findings/",
     "screenshots_dir": "screenshots/"
-  }
+  },
+  "data_sources": [
+    {"name": "Site crawl", "description": "What was fetched and how", "frequency": "Point-in-time (audit date)"}
+  ],
+  "methodology": "Optional one-line methodology note for the report footer"
 }
 ```
+
+The report's Data Sources & Methodology table lists only what the audit used. `data_sources` (optional; strings or `{name, description, frequency}` objects) replaces the default rows (site crawl, specialist analyses, and lab Lighthouse when a performance category exists). Google API rows are added only when `psi`, `crux`, `crux_history`, `gsc`, or `inspection` data is in the envelope; missing ones are listed as not used. `methodology` (optional string) replaces the default footer note.
 
 ## Scoring Weights
 
