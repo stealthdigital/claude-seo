@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Post-edit schema validation hook for Claude Code.
 
-Validates JSON-LD schema after file edits. Returns exit code 2 to block
-if critical validation errors found.
+Validates JSON-LD schema after file edits. The file is already written when
+a PostToolUse hook runs, so nothing here can undo the edit; the hook makes
+sure Claude reads what is wrong:
+
+- critical errors (placeholders, deprecated or retired types): exit 2, with
+  the errors on stderr, which Claude Code feeds back to Claude;
+- warnings only: exit 0, with the warnings as hookSpecificOutput
+  additionalContext JSON on stdout, which Claude reads without an error
+  notice (exit 1 would show them to the user only).
 
 Hook configuration in ~/.claude/settings.json:
 {
@@ -34,20 +41,133 @@ import json
 import os
 import re
 import sys
-from typing import List
+from typing import Any, List
+
+BRACKET_PLACEHOLDERS = (
+    "[Business Name]",
+    "[City]",
+    "[State]",
+    "[Phone]",
+    "[Address]",
+    "[Your",
+    "[INSERT",
+    "[URL]",
+    "[Email]",
+)
+BARE_PLACEHOLDER_RE = re.compile(r"\bREPLACE(?:_[A-Z]+)*\b")
+
+# Match every <script ...>...</script> pair, then filter on the type attribute.
+# The previous pattern required ``type`` to be the first and only attribute, so
+# blocks carrying a CSP ``nonce``, an ``id`` or ``data-*`` attributes, or an
+# unquoted type value were skipped without validation.
+#
+# The attribute group is a small tokenizer, not a plain ``[^>]*``: it consumes a
+# double-quoted value, a single-quoted value, or a run of characters that is
+# neither a quote nor ``>``. A ``[^>]*`` scan ends the tag at the first ``>`` it
+# sees, quoted or not, so an attribute value containing ``>`` (``data-cond="a>b"``,
+# a templated nonce) truncated the tag early and fed the remainder of the
+# attributes plus the real body to the JSON parser as garbage. Treating a quoted
+# span as atomic keeps an embedded ``>`` from ending the tag prematurely.
+# The fallback class excludes both quote characters: if it matched an
+# apostrophe, the alternation would be ambiguous and a tag with many
+# apostrophes and no closing tag would backtrack exponentially, hanging the
+# blocking hook.
+_ATTRS_RE = r'(?:"[^"]*"|\'[^\']*\'|[^"\'>])*'
+SCRIPT_TAG_RE = re.compile(
+    r"<script\b(" + _ATTRS_RE + r")>(.*?)</script\s*>", re.DOTALL | re.IGNORECASE
+)
+LD_JSON_TYPE_RE = re.compile(
+    r"""(?:^|\s)type\s*=\s*"""
+    r"""(?:"application/ld\+json"|'application/ld\+json'|application/ld\+json(?=\s|$))""",
+    re.IGNORECASE,
+)
+
+# Server- or client-side template expressions that render JSON-LD at runtime.
+# The hook runs on .jsx/.tsx/.vue/.svelte/.php/.ejs sources, where the script
+# body is frequently an expression rather than literal JSON. Those blocks cannot
+# be validated statically and must not be reported as invalid JSON.
+SERVER_TEMPLATE_RE = re.compile(
+    r"""^(?:
+        <\?(?:php\b|=)            # <?php ... ?> / <?= ... ?>
+      | <%                        # EJS / ERB
+    )""",
+    re.VERBOSE,
+)
+COMPONENT_EXPRESSION_RE = re.compile(
+    r"""^(?:
+        \{\{                      # Vue / Handlebars / Twig
+      | \{@html\b                 # Svelte
+      | \$\{                      # JS template literal
+      | \{\s*[A-Za-z_$][\w$.]*    # JSX expression: {schema} / {JSON.stringify(...)}
+    )""",
+    re.VERBOSE,
+)
+COMPONENT_EXTENSIONS = (".jsx", ".tsx", ".vue", ".svelte")
+
+SCHEMA_ORG_CONTEXTS = frozenset(
+    {"https://schema.org", "http://schema.org", "https://schema.org/", "http://schema.org/"}
+)
 
 
-def validate_jsonld(content: str) -> List[str]:
+def _configure_utf8() -> None:
+    """Keep hook diagnostics printable on legacy Windows console encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def _extract_ld_json_blocks(content: str) -> List[str]:
+    """Return the bodies of every ``<script type="application/ld+json">`` block.
+
+    Attribute order, extra attributes (``nonce``, ``id``, ``data-*``), tag case
+    and unquoted type values are all accepted; only the type value is decisive.
+    """
+    blocks = []
+    for attributes, body in SCRIPT_TAG_RE.findall(content):
+        if LD_JSON_TYPE_RE.search(attributes):
+            blocks.append(body)
+    return blocks
+
+
+def _is_template_expression(block: str, filepath: str = "") -> bool:
+    """True when the script body is rendered at runtime rather than literal JSON.
+
+    Server-side markers (PHP, EJS) are never valid JSON and are skipped for
+    every file type. Component expressions (JSX, Vue, Svelte, template
+    literals) are only skipped in component sources, so a malformed object
+    literal in a plain ``.html`` file is still reported.
+    """
+    if SERVER_TEMPLATE_RE.match(block):
+        return True
+    if filepath.lower().endswith(COMPONENT_EXTENSIONS):
+        return bool(COMPONENT_EXPRESSION_RE.match(block))
+    return False
+
+
+def _is_schema_org_context(value: Any) -> bool:
+    """Accept the schema.org context in its string, list and object forms."""
+    if isinstance(value, str):
+        return value in SCHEMA_ORG_CONTEXTS
+    if isinstance(value, list):
+        return any(_is_schema_org_context(item) for item in value)
+    if isinstance(value, dict):
+        return _is_schema_org_context(value.get("@vocab"))
+    return False
+
+
+def validate_jsonld(content: str, filepath: str = "") -> List[str]:
     """Validate JSON-LD blocks in HTML content."""
     errors = []
-    pattern = r'<script\s+type=["\']application/ld\+json["\']\s*>(.*?)</script>'
-    blocks = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
+    blocks = _extract_ld_json_blocks(content)
 
     if not blocks:
         return []  # No schema found; not an error
 
     for i, block in enumerate(blocks, 1):
         block = block.strip()
+        if _is_template_expression(block, filepath):
+            continue  # Rendered at runtime; nothing to validate statically
         try:
             data = json.loads(block)
         except json.JSONDecodeError as e:
@@ -56,45 +176,46 @@ def validate_jsonld(content: str) -> List[str]:
 
         if isinstance(data, list):
             for item in data:
-                errors.extend(_validate_schema_object(item, i))
+                if isinstance(item, dict):
+                    errors.extend(_validate_schema_object(item, i))
+                else:
+                    errors.append(f"Block {i}: JSON-LD list members must be objects")
         elif isinstance(data, dict):
             errors.extend(_validate_schema_object(data, i))
+        else:
+            errors.append(f"Block {i}: JSON-LD root must be an object or list")
 
     return errors
 
 
-def _validate_schema_object(obj: dict, block_num: int) -> List[str]:
-    """Validate a single schema object."""
+def _validate_schema_object(
+    obj: dict[str, Any], block_num: int, *, inherited_context: bool = False
+) -> List[str]:
+    """Validate one schema node, including members of a top-level ``@graph``."""
     errors = []
     prefix = f"Block {block_num}"
 
     # Check @context
-    if "@context" not in obj:
+    if "@context" not in obj and not inherited_context:
         errors.append(f"{prefix}: Missing @context")
-    elif obj["@context"] not in ("https://schema.org", "http://schema.org"):
+    elif "@context" in obj and not _is_schema_org_context(obj["@context"]):
         errors.append(f"{prefix}: @context should be 'https://schema.org'")
 
-    # Check @type
-    if "@type" not in obj:
+    graph = obj.get("@graph")
+    has_graph = isinstance(graph, list)
+
+    # A graph container does not need its own @type. Its object members do.
+    if "@type" not in obj and not has_graph:
         errors.append(f"{prefix}: Missing @type")
 
     # Check for placeholder text
-    placeholders = [
-        "[Business Name]",
-        "[City]",
-        "[State]",
-        "[Phone]",
-        "[Address]",
-        "[Your",
-        "[INSERT",
-        "REPLACE",
-        "[URL]",
-        "[Email]",
-    ]
-    text = json.dumps(obj)
-    for p in placeholders:
+    placeholder_scope = {key: value for key, value in obj.items() if key != "@graph"}
+    text = json.dumps(placeholder_scope, ensure_ascii=False)
+    for p in BRACKET_PLACEHOLDERS:
         if p.lower() in text.lower():
             errors.append(f"{prefix}: Contains placeholder text: {p}")
+    for placeholder in BARE_PLACEHOLDER_RE.findall(text):
+        errors.append(f"{prefix}: Contains placeholder text: {placeholder}")
 
     # Check for deprecated types
     schema_type = obj.get("@type", "")
@@ -117,6 +238,25 @@ def _validate_schema_object(obj: dict, block_num: int) -> List[str]:
     restricted: dict = {}
     if schema_type in restricted:
         errors.append(f"{prefix}: @type '{schema_type}' is {restricted[schema_type]}; verify site qualifies")
+
+    if "@graph" in obj:
+        if not isinstance(graph, list):
+            errors.append(f"{prefix}: @graph must be a list")
+        else:
+            context_is_inherited = inherited_context or "@context" in obj
+            for index, item in enumerate(graph, 1):
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"{prefix}: @graph member {index} must be an object"
+                    )
+                    continue
+                errors.extend(
+                    _validate_schema_object(
+                        item,
+                        block_num,
+                        inherited_context=context_is_inherited,
+                    )
+                )
 
     return errors
 
@@ -144,6 +284,7 @@ def _resolve_filepath():
 
 
 def main():
+    _configure_utf8()
     filepath = _resolve_filepath()
     if not filepath:
         sys.exit(0)
@@ -164,12 +305,12 @@ def main():
         sys.exit(0)
 
     try:
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     except (OSError, IOError):
         sys.exit(0)
 
-    errors = validate_jsonld(content)
+    errors = validate_jsonld(content, filepath)
 
     if not errors:
         sys.exit(0)
@@ -179,18 +320,21 @@ def main():
     critical = [e for e in errors if any(kw in e.lower() for kw in critical_keywords)]
     warnings = [e for e in errors if e not in critical]
 
-    if warnings:
-        print("⚠️  Schema validation warnings:")
-        for w in warnings:
-            print(f"  - {w}")
-
     if critical:
-        print("🛑 Schema validation ERRORS (blocking):")
+        # Exit 2: Claude Code feeds stderr back to Claude (stdout is ignored).
+        print("🛑 Schema validation ERRORS (flagged for Claude, fix before shipping):", file=sys.stderr)
         for e in critical:
-            print(f"  - {e}")
-        sys.exit(2)  # Block the edit
+            print(f"  - {e}", file=sys.stderr)
+        if warnings:
+            print("⚠️  Also warnings:", file=sys.stderr)
+            for w in warnings:
+                print(f"  - {w}", file=sys.stderr)
+        sys.exit(2)
 
-    sys.exit(1)  # Warnings only; proceed
+    # Warnings only: exit 0 with JSON, so Claude reads them as context.
+    context = "Schema validation warnings for " + filepath + ":\n" + "\n".join(f"- {w}" for w in warnings)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
+    sys.exit(0)
 
 
 if __name__ == "__main__":

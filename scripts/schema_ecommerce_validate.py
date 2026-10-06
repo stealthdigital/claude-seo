@@ -16,7 +16,7 @@ property groups that strongly influence merchant listing diagnostics:
   - ``ProductGroup`` for size/colour variants
 
 The Rich Results Test catches structural errors. This validator catches
-the *policy* errors — fields that parse fine but disqualify the product
+the *policy* errors: fields that parse fine but disqualify the product
 from a rich feature. It also flags the deprecated v1.x types
 (Vehicle Listing, Claim Review, Estimated Salary, Learning Video,
 Course Info, Special Announcement).
@@ -36,7 +36,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-
 
 # Types Google retired June 2025 (announced via developers.google.com/search/blog
 # /2025/06/simplifying-search-results). Generating any of these in 2026 is a
@@ -245,7 +244,7 @@ def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
                            "energyEfficiencyClass per EPREL regulation.",
             })
 
-    # 8. ProductGroup variant guidance — emit as Info if a Product is found
+    # 8. ProductGroup variant guidance: emit as Info if a Product is found
     # without any variant declaration.
     has_product_group = bool(list(_iter_typed(payload, "ProductGroup")))
     if products and not has_product_group:
@@ -253,7 +252,7 @@ def validate(payload: dict | list, *, require_eu_energy: bool = False) -> dict:
             "severity": "Info",
             "rule": "no-product-group",
             "message": "Consider ProductGroup if the product has size/colour "
-                       "variants — Google increasingly enforces this for "
+                       "variants; Google increasingly enforces this for "
                        "apparel.",
         })
 

@@ -16,7 +16,6 @@ import argparse
 import json
 import sys
 import time
-from typing import Optional
 from urllib.parse import urlparse
 
 try:
@@ -26,12 +25,13 @@ except ImportError:
     sys.exit(1)
 
 import os
+
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
 try:
     from fetch_page import fetch_page
-    from parse_html import parse_html
     from google_auth import validate_url
+    from parse_html import parse_html
     from url_safety import URLSafetyError, safe_requests_head
 except ImportError as e:
     print(f"Error: Required scripts not found in scripts/: {e}", file=sys.stderr)
@@ -208,7 +208,7 @@ def verify_single_backlink(source_url: str, target_url: str,
         result["status"] = "verified"
         return result
 
-    # Target not found — check if page is JS-rendered (false negative risk)
+    # Target not found: check if page is JS-rendered (false negative risk)
     content = page_data.get("content", "")
     js_indicators = [
         '<div id="root"', '<div id="app"', '<div id="__next"',

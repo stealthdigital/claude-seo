@@ -20,13 +20,12 @@ import sys
 from datetime import datetime
 from html import escape
 from pathlib import Path
-from typing import Optional
 
 try:
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
+    import matplotlib.pyplot as plt
     import numpy as np
     _CHART_IMPORT_ERROR = None
 except (ImportError, OSError, RuntimeError) as exc:
@@ -280,8 +279,6 @@ def chart_cwv_timeline(data: dict, output_dir: Path) -> str:
         axes = [axes]
 
     x_labels = [p.get("last", "")[-5:] for p in periods]  # MM-DD format
-    x = range(len(x_labels))
-
     for ax, metric_name in zip(axes, available):
         m = metrics[metric_name]
         p75s = m.get("p75_values", [])
@@ -406,6 +403,56 @@ def chart_index_status(data: dict, output_dir: Path) -> str:
 
     plt.tight_layout()
     path = output_dir / "index_status.png"
+    plt.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    return str(path)
+
+
+def _category_score_rows(data: dict) -> list:
+    """Return (name, score) pairs for audit categories with a numeric score."""
+    rows = []
+    for category in _coerce_items(data.get("categories")):
+        if not isinstance(category, dict):
+            continue
+        try:
+            score = float(category.get("score"))
+        except (TypeError, ValueError):
+            continue
+        rows.append((str(category.get("name") or f"Category {len(rows) + 1}"), score))
+    return rows
+
+
+def chart_category_scores(data: dict, output_dir: Path) -> str:
+    """Generate horizontal bars of audit category scores (audit-data.json envelopes).
+
+    Unlike the Google API charts, this one is optional garnish on envelope-only
+    reports, so a missing matplotlib skips the chart instead of failing the report.
+    """
+    rows = _category_score_rows(data)
+    if not rows or plt is None:
+        return ""
+
+    labels = [name[:40] for name, _ in rows]
+    scores = [max(0.0, min(100.0, score)) for _, score in rows]
+    # Same 80/50 thresholds as the category section's pass/warn/fail badges.
+    colors = [
+        BRAND["success"] if s >= 80 else (BRAND["warning"] if s >= 50 else BRAND["danger"])
+        for s in scores
+    ]
+
+    fig, ax = plt.subplots(figsize=(7, max(2, len(labels) * 0.45)))
+    y = range(len(labels))
+    ax.barh(y, scores, color=colors, height=0.55)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlim(0, 105)
+    ax.set_xlabel("Score (0-100)")
+    ax.invert_yaxis()
+    for i, score in enumerate(scores):
+        ax.text(score + 1.5, i, f"{score:g}", va="center", fontsize=9, color=BRAND["dark"])
+
+    plt.tight_layout()
+    path = output_dir / "category_scores.png"
     plt.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close()
     return str(path)
@@ -986,7 +1033,8 @@ def _metric_card(value, label, color=None):
 
 # ─── Section Builders ────────────────────────────────────────────────────────
 
-def _build_title_page(domain, report_title, subtitle, score=None, score_label=None, meta_items=None):
+def _build_title_page(domain, report_title, subtitle, score=None, score_label=None, meta_items=None,
+                      show_google_logo=True):
     """Build the gradient title page."""
     score_html = ""
     if score is not None:
@@ -1010,7 +1058,7 @@ def _build_title_page(domain, report_title, subtitle, score=None, score_label=No
     # Google logo (if available in charts dir)
     google_logo_path = Path(__file__).parent.parent / "charts" / "google_logo.png"
     google_logo_html = ""
-    if google_logo_path.exists():
+    if show_google_logo and google_logo_path.exists():
         google_logo_html = (
             f'  <div style="margin-top: 8mm;">\n'
             f'    <img src="file://{google_logo_path}" style="height: 20px; opacity: 0.7;" alt="Google">\n'
@@ -1091,7 +1139,7 @@ def _finding_description(item):
     return ""
 
 
-def _build_full_audit_categories(data, section_num=2):
+def _build_full_audit_categories(data, section_num=2, chart_path="", fig_num=1):
     """Build category sections for audit-data.json style reports."""
     categories = _coerce_items(data.get("categories"))
     if not categories:
@@ -1104,6 +1152,12 @@ def _build_full_audit_categories(data, section_num=2):
     lines.append(f'    <h2>{section_num}. Audit Categories</h2>')
     lines.append('  </div>')
     lines.append('')
+    if chart_path:
+        lines.append(_chart_html(
+            chart_path,
+            "Score by audit category (0-100). Green 80+, amber 50-79, red below 50.",
+            fig_num, alt="Audit category scores",
+        ))
 
     for idx, category in enumerate(categories, 1):
         if not isinstance(category, dict):
@@ -1132,14 +1186,21 @@ def _build_full_audit_categories(data, section_num=2):
             lines.append('  <h4>Findings</h4>')
             for finding in findings:
                 title = escape(_finding_title(finding))
-                severity = escape(_finding_severity(finding))
                 desc = escape(_finding_description(finding))
                 recommendation = ""
                 if isinstance(finding, dict) and finding.get("recommendation"):
                     recommendation = escape(str(finding["recommendation"]))
-                severity_class = _rating_css_class(severity)
                 lines.append('  <div class="action-item medium">')
-                lines.append(f'    <h4>{title} <span class="{severity_class}">{severity}</span></h4>')
+                # Only label a severity when the finding actually carries one. Plain-string
+                # findings have no severity, and _finding_severity() falls back to "Info" --
+                # which would badge every entry as "Info" (see the executive-summary fix for
+                # the same shape). Dict-shaped findings with an explicit severity keep it.
+                if isinstance(finding, dict) and finding.get("severity"):
+                    severity = escape(str(finding["severity"]))
+                    severity_class = _rating_css_class(severity)
+                    lines.append(f'    <h4>{title} <span class="{severity_class}">{severity}</span></h4>')
+                else:
+                    lines.append(f'    <h4>{title}</h4>')
                 if desc:
                     lines.append(f'    <p>{desc}</p>')
                 if recommendation:
@@ -1262,18 +1323,24 @@ def _build_executive_summary(domain, timestamp, data, report_type):
         display_cards = cards[:5]
         lines.append(f'  <div class="{col_class}">')
         for _, val, lbl, clr in display_cards:
-            lines.append(f'    <div class="col">')
+            lines.append('    <div class="col">')
             lines.append(_metric_card(val, lbl, clr))
-            lines.append(f'    </div>')
+            lines.append('    </div>')
         lines.append('  </div>')
         lines.append('')
 
     # Critical issues box
     issues = []
     for item in _coerce_items(summary.get("top_findings")):
-        severity = _finding_severity(item)
         title = _finding_title(item)
-        issues.append(f'<strong>{escape(severity)}:</strong> {escape(title)}')
+        # Only label a severity when the finding actually carries one. Plain-string
+        # top_findings (the shape documented in seo-audit/SKILL.md) have no severity, and
+        # _finding_severity() falls back to "Info" -- which rendered every entry in the
+        # "Critical Issues Found" box as "Info:", understating the whole section.
+        if isinstance(item, dict) and item.get("severity"):
+            issues.append(f'<strong>{escape(str(item["severity"]))}:</strong> {escape(title)}')
+        else:
+            issues.append(escape(title))
 
     failed_audits = mobile.get("failed_audits", [])
     if failed_audits:
@@ -1331,9 +1398,10 @@ def _build_executive_summary(domain, timestamp, data, report_type):
     return "\n".join(lines)
 
 
-def _build_cwv_section(psi_data, crux_data, chart_paths, history_data=None, section_num=2):
+def _build_cwv_section(psi_data, crux_data, chart_paths, history_data=None, section_num=2,
+                       fig_start=1):
     """Build the Core Web Vitals audit section."""
-    fig_counter = [1]  # mutable counter for figure numbering
+    fig_counter = [fig_start]  # mutable counter for figure numbering
 
     def next_fig():
         n = fig_counter[0]
@@ -1421,7 +1489,7 @@ def _build_cwv_section(psi_data, crux_data, chart_paths, history_data=None, sect
             cls = ("status-pass" if score_val and score_val >= 0.9
                    else ("status-warn" if score_val and score_val >= 0.5 else "status-fail"))
             label = metric_labels.get(k, k.replace("-", " ").title())
-            threshold = thresholds.get(k, "\u2014")
+            threshold = thresholds.get(k, "n/a")
             lines.append(f'      <tr><td>{label}</td><td>{v.get("display", "")}</td>'
                          f'<td class="{cls}">{score_pct}</td><td>{threshold}</td></tr>')
         lines.append('    </tbody>')
@@ -1535,9 +1603,9 @@ def _build_cwv_section(psi_data, crux_data, chart_paths, history_data=None, sect
         if seo_failed:
             lines.append(f'  <h3>SEO Audit Issues ({len(seo_failed)})</h3>')
             for a in seo_failed:
-                lines.append(f'  <div class="action-item critical">')
+                lines.append('  <div class="action-item critical">')
                 lines.append(f'    <h4>{a.get("title", "")}</h4>')
-                lines.append(f'  </div>')
+                lines.append('  </div>')
         else:
             lines.append(f'  <div class="success-box"><strong>SEO:</strong> '
                          f'All {len(seo_audits)} Lighthouse SEO checks passed.</div>')
@@ -1672,12 +1740,12 @@ def _build_gsc_section(gsc_data, chart_paths, section_num=3, fig_start=1):
         beyond = len([r for r in rows if r.get("position", 99) > 10])
         lines.append(f'  <h3>{section_num}.4 Query Position Analysis</h3>')
         lines.append('  <div class="two-col">')
-        lines.append(f'    <div class="col">')
+        lines.append('    <div class="col">')
         lines.append(_metric_card(str(top3), "Queries in Top 3", BRAND["success"]))
-        lines.append(f'    </div>')
-        lines.append(f'    <div class="col">')
+        lines.append('    </div>')
+        lines.append('    <div class="col">')
         lines.append(_metric_card(str(top10), "Queries in Top 10", BRAND["warning"]))
-        lines.append(f'    </div>')
+        lines.append('    </div>')
         lines.append('  </div>')
         if beyond:
             lines.append(f'  <p>{beyond} queries rank beyond position 10 '
@@ -1739,25 +1807,24 @@ def _build_indexation_section(inspect_data, chart_paths, section_num=4, fig_star
         if idx_path:
             fig_n = next_fig()
             lines.append(f'  <h3>{section_num}.1 Index Coverage Overview</h3>')
-            lines.append(f'    <div class="chart-container">')
+            lines.append('    <div class="chart-container">')
             lines.append(f'      <img src="file://{idx_path}" style="width: 70%;" alt="Index status donut chart">')
             lines.append(f'      <div class="chart-caption">Figure {fig_n}: URL indexation status distribution from Google URL Inspection API.</div>')
-            lines.append(f'    </div>')
+            lines.append('    </div>')
 
         # Summary cards
         lines.append(f'  <p>Total URLs inspected: <strong>{total}</strong></p>')
         lines.append('  <div class="two-col">')
-        lines.append(f'    <div class="col">')
+        lines.append('    <div class="col">')
         lines.append(_metric_card(summary.get("pass", 0), "Indexed", BRAND["success"]))
-        lines.append(f'    </div>')
-        lines.append(f'    <div class="col">')
+        lines.append('    </div>')
+        lines.append('    <div class="col">')
         lines.append(_metric_card(summary.get("fail", 0), "Not Indexed", BRAND["danger"]))
-        lines.append(f'    </div>')
+        lines.append('    </div>')
         lines.append('  </div>')
         lines.append('')
 
         indexed = summary.get("pass", 0)
-        not_indexed = summary.get("fail", 0)
         if total > 0:
             rate = round((indexed / total) * 100, 1)
             lines.append(f'  <p><strong>Index Rate:</strong> {rate}% of inspected URLs are indexed by Google.</p>')
@@ -1865,15 +1932,15 @@ def _build_recommendations(data, section_num=5):
         )
 
     if critical_items:
-        lines.append(f'  <h3><span class="priority-tag priority-critical">CRITICAL</span> '
-                     f'Fix Immediately</h3>')
+        lines.append('  <h3><span class="priority-tag priority-critical">CRITICAL</span> '
+                     'Fix Immediately</h3>')
         for title, effort, desc in critical_items:
             item_num += 1
-            lines.append(f'  <div class="action-item critical">')
+            lines.append('  <div class="action-item critical">')
             lines.append(f'    <h4>{item_num}. {title} '
                          f'<span class="effort">Effort: {effort}</span></h4>')
             lines.append(f'    <p>{desc}</p>')
-            lines.append(f'  </div>')
+            lines.append('  </div>')
         lines.append('')
 
     # High priority items
@@ -1906,15 +1973,15 @@ def _build_recommendations(data, section_num=5):
         )
 
     if high_items:
-        lines.append(f'  <h3><span class="priority-tag priority-high">HIGH</span> '
-                     f'Fix Within 1 Week</h3>')
+        lines.append('  <h3><span class="priority-tag priority-high">HIGH</span> '
+                     'Fix Within 1 Week</h3>')
         for title, effort, desc in high_items:
             item_num += 1
-            lines.append(f'  <div class="action-item high">')
+            lines.append('  <div class="action-item high">')
             lines.append(f'    <h4>{item_num}. {title} '
                          f'<span class="effort">Effort: {effort}</span></h4>')
             lines.append(f'    <p>{desc}</p>')
-            lines.append(f'  </div>')
+            lines.append('  </div>')
         lines.append('')
 
     # Medium priority items
@@ -1944,15 +2011,15 @@ def _build_recommendations(data, section_num=5):
         )
 
     if medium_items:
-        lines.append(f'  <h3><span class="priority-tag priority-medium">MEDIUM</span> '
-                     f'Fix Within 1 Month</h3>')
+        lines.append('  <h3><span class="priority-tag priority-medium">MEDIUM</span> '
+                     'Fix Within 1 Month</h3>')
         for title, effort, desc in medium_items:
             item_num += 1
-            lines.append(f'  <div class="action-item medium">')
+            lines.append('  <div class="action-item medium">')
             lines.append(f'    <h4>{item_num}. {title} '
                          f'<span class="effort">Effort: {effort}</span></h4>')
             lines.append(f'    <p>{desc}</p>')
-            lines.append(f'  </div>')
+            lines.append('  </div>')
         lines.append('')
 
     # If no recommendations were generated at all
@@ -1965,7 +2032,7 @@ def _build_recommendations(data, section_num=5):
     lines.append('  <hr class="divider">')
     lines.append('  <h3>Implementation Roadmap</h3>')
     lines.append('  <div class="roadmap-phase">')
-    lines.append('    <h4>Week 1 &mdash; Quick Wins</h4>')
+    lines.append('    <h4>Week 1: Quick Wins</h4>')
     lines.append('    <ul>')
     if seo_failed:
         lines.append('      <li>Fix failing Lighthouse SEO checks</li>')
@@ -1979,7 +2046,7 @@ def _build_recommendations(data, section_num=5):
     lines.append('    </ul>')
     lines.append('  </div>')
     lines.append('  <div class="roadmap-phase">')
-    lines.append('    <h4>Week 2&ndash;3 &mdash; Performance &amp; Indexation</h4>')
+    lines.append('    <h4>Weeks 2 to 3: Performance &amp; Indexation</h4>')
     lines.append('    <ul>')
     if perf is not None and perf < 50:
         lines.append('      <li>Optimize Largest Contentful Paint and Total Blocking Time</li>')
@@ -1992,7 +2059,7 @@ def _build_recommendations(data, section_num=5):
     lines.append('    </ul>')
     lines.append('  </div>')
     lines.append('  <div class="roadmap-phase">')
-    lines.append('    <h4>Week 4 &mdash; Content &amp; Search Optimization</h4>')
+    lines.append('    <h4>Week 4: Content &amp; Search Optimization</h4>')
     lines.append('    <ul>')
     if qw:
         lines.append(f'      <li>Optimize {len(qw)} quick-win queries for top-3 rankings</li>')
@@ -2006,14 +2073,164 @@ def _build_recommendations(data, section_num=5):
     return "\n".join(lines)
 
 
-def _build_methodology_footer(domain, timestamp, gsc_warning=""):
-    """Build the Data Sources & Methodology footer section."""
+# Google API sources the report can draw on, keyed by their data-envelope key.
+GOOGLE_SOURCE_ROWS = [
+    ("psi", "PageSpeed Insights API",
+     "Lighthouse lab audit (mobile emulation, Moto G Power, slow 4G)", "Real-time"),
+    ("crux", "Chrome UX Report (CrUX)",
+     "28-day rolling field data from real Chrome users", "Daily ~04:00 UTC"),
+    ("crux_history", "CrUX History API", "25-week p75 trend data per metric", "Weekly"),
+    ("gsc", "Google Search Console",
+     "Search Analytics (clicks, impressions, CTR, position)", "2-3 day lag"),
+    ("inspection", "URL Inspection API",
+     "Per-URL index status, coverage state, crawl info", "Real-time (2,000/day)"),
+]
+
+
+def _has_source_data(value):
+    """True when an API payload carries data rather than being empty or an error stub."""
+    if not value:
+        return False
+    if isinstance(value, dict) and value.get("error"):
+        return False
+    return True
+
+
+def _detect_google_sources(report_type, data):
+    """Return the GOOGLE_SOURCE_ROWS keys whose data is actually present."""
+    if not isinstance(data, dict):
+        return []
+    psi = data.get("psi")
+    crux = data.get("crux")
+    if not _has_source_data(crux) and isinstance(psi, dict):
+        crux = psi.get("crux")  # pagespeed_check.py nests CrUX inside its PSI output
+    present = {
+        "psi": _has_source_data(psi),
+        "crux": _has_source_data(crux),
+        "crux_history": _has_source_data(data.get("crux_history")),
+        "gsc": _has_source_data(data.get("gsc")),
+        "inspection": _has_source_data(data.get("inspection")),
+    }
+    # Single-source report types accept the raw script output as the whole payload.
+    if report_type == "cwv-audit":
+        present["psi"] = present["psi"] or "psi" not in data
+    elif report_type == "gsc-performance":
+        present["gsc"] = True
+    elif report_type == "indexation":
+        present["inspection"] = True
+    return [key for key, *_ in GOOGLE_SOURCE_ROWS if present[key]]
+
+
+def _is_audit_envelope(data):
+    """True for seo-audit audit-data.json envelopes (summary/categories/action_plan)."""
+    if not isinstance(data, dict):
+        return False
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    return bool(summary or data.get("categories") or data.get("action_plan"))
+
+
+def _envelope_source_rows(data):
+    """Rows from an envelope's optional data_sources list (strings or dicts)."""
+    rows = []
+    for item in _coerce_items(data.get("data_sources")):
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("source")
+            if name:
+                rows.append((
+                    str(name),
+                    str(item.get("description", "")),
+                    str(item.get("frequency") or item.get("update_frequency") or ""),
+                ))
+        elif item:
+            rows.append((str(item), "", ""))
+    return rows
+
+
+def _default_audit_source_rows(data):
+    """Describe how a seo-audit full audit gathered its evidence."""
+    names = [
+        str(c["name"]) for c in _coerce_items(data.get("categories"))
+        if isinstance(c, dict) and c.get("name")
+    ]
+    specialist_desc = "Parallel specialist reviews"
+    if names:
+        specialist_desc += ": " + ", ".join(names)
+    rows = [
+        ("Site crawl",
+         "Live fetch and parse of robots.txt, sitemaps, page HTML, response headers "
+         "and internal links",
+         "Point-in-time (audit date)"),
+        ("Specialist analyses", specialist_desc, "Point-in-time (audit date)"),
+    ]
+    if any("performance" in n.lower() or "cwv" in n.lower() for n in names):
+        rows.append((
+            "Lighthouse (lab)",
+            "Lab performance audit with simulated mobile throttling; not real-user field data",
+            "Point-in-time (audit date)",
+        ))
+    return rows
+
+
+def _build_methodology_footer(domain, timestamp, gsc_warning="", report_type="full", data=None):
+    """Build the Data Sources & Methodology footer section.
+
+    Lists only the sources whose data is present in ``data``. A seo-audit
+    envelope without Google API data describes the audit's own methodology
+    (crawl, specialist analyses, lab Lighthouse) or its ``data_sources`` list.
+    """
+    data = data if isinstance(data, dict) else {}
+    google_keys = _detect_google_sources(report_type, data)
+    is_audit = report_type == "full" and _is_audit_envelope(data)
+
+    rows = []
+    if is_audit:
+        rows = _envelope_source_rows(data) or _default_audit_source_rows(data)
+    listed = {name.lower() for name, _, _ in rows}
+    rows += [
+        (name, desc, freq) for key, name, desc, freq in GOOGLE_SOURCE_ROWS
+        if key in google_keys and name.lower() not in listed
+    ]
+
+    rows_html = "".join(
+        f'      <tr><td>{escape(name)}</td>\n'
+        f'          <td>{escape(desc)}</td>\n'
+        f'          <td>{escape(freq)}</td></tr>\n'
+        for name, desc, freq in rows
+    )
+
     warning_html = ""
     if gsc_warning:
         warning_html = (
             f'  <p class="data-freshness"><strong>GSC data warning:</strong> '
             f'{escape(gsc_warning)}</p>\n'
         )
+
+    unused_html = ""
+    if is_audit:
+        unused = [name for key, name, *_ in GOOGLE_SOURCE_ROWS
+                  if key not in google_keys and name.lower() not in listed]
+        if unused:
+            unused_html = (
+                f'  <p class="data-freshness">Not used in this audit: '
+                f'{escape(", ".join(unused))}.</p>\n'
+            )
+
+    if isinstance(data.get("methodology"), str) and data["methodology"].strip():
+        methodology_text = escape(data["methodology"].strip())
+    elif google_keys and not is_audit:
+        methodology_text = (
+            "Methodology based on Google Web Vitals thresholds, Search Console documentation, "
+            "and Lighthouse scoring algorithms."
+        )
+    elif is_audit:
+        methodology_text = (
+            "The SEO Health Score is a weighted aggregate of the category scores. "
+            "Findings reflect the site as observed on the audit date."
+        )
+    else:
+        methodology_text = "Findings reflect the data supplied on the report date."
+    generator = "Claude SEO (Google SEO Intelligence Skill)" if google_keys else "Claude SEO"
+
     return (
         f'\n<!-- {"=" * 55} DATA SOURCES & METHODOLOGY {"=" * 3} -->\n'
         f'<div class="section" style="text-align: center; padding-top: 15mm;">\n'
@@ -2024,29 +2241,14 @@ def _build_methodology_footer(domain, timestamp, gsc_warning=""):
         f'      <tr><th>Source</th><th>Description</th><th>Update Frequency</th></tr>\n'
         f'    </thead>\n'
         f'    <tbody>\n'
-        f'      <tr><td>PageSpeed Insights API</td>\n'
-        f'          <td>Lighthouse lab audit (mobile emulation, Moto G Power, slow 4G)</td>\n'
-        f'          <td>Real-time</td></tr>\n'
-        f'      <tr><td>Chrome UX Report (CrUX)</td>\n'
-        f'          <td>28-day rolling field data from real Chrome users</td>\n'
-        f'          <td>Daily ~04:00 UTC</td></tr>\n'
-        f'      <tr><td>CrUX History API</td>\n'
-        f'          <td>25-week p75 trend data per metric</td>\n'
-        f'          <td>Weekly</td></tr>\n'
-        f'      <tr><td>Google Search Console</td>\n'
-        f'          <td>Search Analytics (clicks, impressions, CTR, position)</td>\n'
-        f'          <td>2-3 day lag</td></tr>\n'
-        f'      <tr><td>URL Inspection API</td>\n'
-        f'          <td>Per-URL index status, coverage state, crawl info</td>\n'
-        f'          <td>Real-time (2,000/day)</td></tr>\n'
+        f'{rows_html}'
         f'    </tbody>\n'
         f'  </table>\n'
+        f'{unused_html}'
         f'{warning_html}'
         f'  <p style="color: #94a3b8; font-size: 9pt; margin-top: 5mm;">\n'
-        f'    Report generated by Claude SEO &mdash; Google SEO Intelligence Skill &mdash; '
-        f'{timestamp}<br>\n'
-        f'    Methodology based on Google Web Vitals thresholds, Search Console documentation, '
-        f'and Lighthouse scoring algorithms.\n'
+        f'    Report generated by {generator}, {timestamp}<br>\n'
+        f'    {methodology_text}\n'
         f'  </p>\n'
         f'</div>\n'
     )
@@ -2073,7 +2275,6 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
     charts_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%B %d, %Y")
-    timestamp_short = datetime.now().strftime("%Y-%m-%d %H:%M")
     result = {"report_type": report_type, "domain": domain, "files": [], "error": None}
 
     # ── Generate Charts ──────────────────────────────────────────────────────
@@ -2110,6 +2311,11 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
             path = chart_index_status(inspect, charts_dir)
             if path:
                 chart_paths["index_status_path"] = path
+
+        if report_type == "full":
+            path = chart_category_scores(data, charts_dir)
+            if path:
+                chart_paths["category_scores_path"] = path
     except RuntimeError as exc:
         result["error"] = str(exc)
         return result
@@ -2161,7 +2367,8 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
         sections.append(cwv_html)
 
         sections.append(_build_recommendations(data, section_num=3))
-        sections.append(_build_methodology_footer(domain, timestamp))
+        sections.append(_build_methodology_footer(
+            domain, timestamp, report_type=report_type, data=data))
 
     # ── GSC-PERFORMANCE report ───────────────────────────────────────────────
     elif report_type == "gsc-performance":
@@ -2199,7 +2406,8 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
         sections.append(gsc_html)
 
         sections.append(_build_recommendations(data, section_num=3))
-        sections.append(_build_methodology_footer(domain, timestamp, _gsc_anomaly_warning(gsc)))
+        sections.append(_build_methodology_footer(
+            domain, timestamp, _gsc_anomaly_warning(gsc), report_type=report_type, data=data))
 
     # ── INDEXATION report ────────────────────────────────────────────────────
     elif report_type == "indexation":
@@ -2235,7 +2443,8 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
         sections.append(idx_html)
 
         sections.append(_build_recommendations(data, section_num=3))
-        sections.append(_build_methodology_footer(domain, timestamp))
+        sections.append(_build_methodology_footer(
+            domain, timestamp, report_type=report_type, data=data))
 
     # ── FULL report ──────────────────────────────────────────────────────────
     elif report_type == "full":
@@ -2245,7 +2454,7 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
         summary = data.get("summary", {}) if isinstance(data.get("summary"), dict) else {}
         health_score = summary.get("health_score")
         display_score = health_score if health_score is not None else perf_score
-        has_audit_schema = bool(summary or data.get("categories") or data.get("action_plan"))
+        has_audit_schema = _is_audit_envelope(data)
 
         sections.append(_build_title_page(
             domain, "Full SEO Audit Report" if has_audit_schema else "Google SEO Intelligence Report",
@@ -2253,6 +2462,7 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
             score=display_score,
             score_label="SEO Health Score" if health_score is not None else ("Lighthouse Performance Score" if perf_score else None),
             meta_items=[timestamp, "Full Audit"],
+            show_google_logo=bool(_detect_google_sources(report_type, data)),
         ))
 
         # Build TOC dynamically based on available data
@@ -2318,13 +2528,18 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
 
         current_sec = 2
         if data.get("categories"):
-            sections.append(_build_full_audit_categories(data, section_num=current_sec))
+            category_chart = chart_paths.get("category_scores_path", "")
+            sections.append(_build_full_audit_categories(
+                data, section_num=current_sec, chart_path=category_chart, fig_num=fig_num,
+            ))
+            if category_chart:
+                fig_num += 1
             current_sec += 1
 
         if data.get("psi") or data.get("crux"):
             cwv_html, fig_num = _build_cwv_section(
                 data.get("psi", {}), data.get("crux", {}), chart_paths,
-                data.get("crux_history"), section_num=current_sec,
+                data.get("crux_history"), section_num=current_sec, fig_start=fig_num,
             )
             sections.append(cwv_html)
             current_sec += 1
@@ -2350,7 +2565,10 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
             sections.append(action_html)
         else:
             sections.append(_build_recommendations(data, section_num=rec_num))
-        sections.append(_build_methodology_footer(domain, timestamp, _gsc_anomaly_warning(data.get("gsc", {}))))
+        sections.append(_build_methodology_footer(
+            domain, timestamp, _gsc_anomaly_warning(data.get("gsc", {})),
+            report_type=report_type, data=data,
+        ))
 
     # ── Assemble Final HTML ──────────────────────────────────────────────────
 
@@ -2391,10 +2609,11 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
             return result
         pdf_path = output_dir / f"{base_name}.pdf"
         try:
-            HTML(string=html_content).write_pdf(str(pdf_path))
+            document = HTML(string=html_content).render()
+            document.write_pdf(str(pdf_path))
             result["files"].append(str(pdf_path))
             # Post-generation review
-            review = _review_pdf(str(pdf_path), html_content)
+            review = _review_pdf(str(pdf_path), html_content, page_count=len(document.pages))
             if review:
                 result["review"] = review
         except Exception as e:
@@ -2408,12 +2627,16 @@ def generate_report(report_type, data, domain, output_dir, output_format="pdf"):
     return result
 
 
-def _review_pdf(pdf_path: str, html_content: str) -> dict:
+def _review_pdf(pdf_path: str, html_content: str, page_count=None) -> dict:
     """
     RULE: Always review the PDF before presenting to the user.
     Check for common rendering issues.
+
+    ``page_count`` comes from the WeasyPrint render. Without it, pypdf is tried
+    as an optional fallback; a missing optional checker is recorded under
+    ``checks_skipped`` and does not count as an issue.
     """
-    review = {"issues": [], "page_count": None, "file_size_kb": None}
+    review = {"issues": [], "page_count": page_count, "file_size_kb": None, "checks_skipped": []}
 
     # File size
     try:
@@ -2422,13 +2645,12 @@ def _review_pdf(pdf_path: str, html_content: str) -> dict:
     except OSError:
         pass
 
-    # Page count (if pypdf available)
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(pdf_path)
-        review["page_count"] = len(reader.pages)
-    except ImportError:
-        review["issues"].append("pypdf missing, page-count check skipped")
+    if review["page_count"] is None:
+        try:
+            from pypdf import PdfReader
+            review["page_count"] = len(PdfReader(pdf_path).pages)
+        except ImportError:
+            review["checks_skipped"].append("page_count (pypdf not installed)")
 
     # HTML-level checks
     import re
@@ -2468,7 +2690,7 @@ def generate_xlsx(data, domain, report_type, output_dir):
     """
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
     except ImportError:
         print("Warning: openpyxl not installed. Skipping xlsx. Install: pip install openpyxl", file=sys.stderr)
@@ -2484,7 +2706,6 @@ def generate_xlsx(data, domain, report_type, output_dir):
     amber_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
     red_fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
     header_font = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
-    body_font = Font(name="Calibri", size=10)
     thin_border = Border(
         left=Side(style="thin", color="D6D3CC"),
         right=Side(style="thin", color="D6D3CC"),
